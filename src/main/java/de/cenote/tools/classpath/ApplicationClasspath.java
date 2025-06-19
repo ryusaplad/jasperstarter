@@ -72,14 +72,62 @@ public class ApplicationClasspath {
      * @throws java.io.IOException if any.
      */
     public static void add(URL url) throws IOException {
-        URLClassLoader systemClassLoader = (URLClassLoader) ClassLoader.getSystemClassLoader();
-        Class<?> urlClassLoaderClass = URLClassLoader.class;
+        ClassLoader systemClassLoader = ClassLoader.getSystemClassLoader();
         try {
-            Method method = urlClassLoaderClass.getDeclaredMethod("addURL", parameterTypes);
-            method.setAccessible(true);
-            method.invoke(systemClassLoader, new Object[]{url});
+            if (systemClassLoader instanceof URLClassLoader) {
+                // Java 8 approach
+                URLClassLoader urlClassLoader = (URLClassLoader) systemClassLoader;
+                Class<?> urlClassLoaderClass = URLClassLoader.class;
+                Method method = urlClassLoaderClass.getDeclaredMethod("addURL", parameterTypes);
+                method.setAccessible(true);
+                method.invoke(urlClassLoader, new Object[]{url});
+            } else {
+                // Java 9+ approaches - try multiple methods
+                boolean success = false;
+                
+                // Attemp #1: Try to find and use the addURL method
+                try {
+                    Method method = systemClassLoader.getClass().getDeclaredMethod("addURL", URL.class);
+                    method.setAccessible(true);
+                    method.invoke(systemClassLoader, url);
+                    success = true;
+                } catch (Exception e) {
+                    // Method not found, try next approach
+                }
+                
+                // Attempt #2: Try to access UCP (URL Class Path) field
+                if (!success) {
+                    try {
+                        Method ucpMethod = systemClassLoader.getClass().getDeclaredMethod("ucp");
+                        ucpMethod.setAccessible(true);
+                        Object ucp = ucpMethod.invoke(systemClassLoader);
+                        Method addURLMethod = ucp.getClass().getDeclaredMethod("addURL", URL.class);
+                        addURLMethod.setAccessible(true);
+                        addURLMethod.invoke(ucp, url);
+                        success = true;
+                    } catch (Exception e) {
+                        // Method not found, try next approach
+                    }
+                }
+                
+                // Last: Try to use instrumentation API for Java 9+
+                if (!success) {
+                    try {
+                        // Create a new class loader with our URL and use it to load classes
+                        URLClassLoader newLoader = new URLClassLoader(new URL[]{url}, systemClassLoader);
+                        Thread.currentThread().setContextClassLoader(newLoader);
+                        success = true;
+                    } catch (Exception e) {
+                        // Failed to set context class loader
+                    }
+                }
+                
+                if (!success) {
+                    throw new IOException("Failed to add URL to classpath. Running on Java 9+ requires external classpath configuration.");
+                }
+            }
         } catch (Exception e) {
-            throw new IOException("Error, could not add URL to system classloader!");
+            throw new IOException("Error, could not add URL to system classloader: " + e.getMessage(), e);
         }
     }
 

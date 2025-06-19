@@ -27,6 +27,8 @@ import java.io.IOException;
 import java.io.PrintStream;
 
 import java.net.URISyntaxException;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -166,22 +168,11 @@ public class App {
 
     private void processReport(Config config)
             throws IllegalArgumentException, InterruptedException, JRException {
-        // add the jdbc dir to classpath
-        try {
-            if (config.hasJdbcDir()) {
-                File jdbcDir = config.getJdbcDir();
-                if (config.isVerbose()) {
-                    configSink.println("Using jdbc-dir: " + jdbcDir.getAbsolutePath());
-                }
-                ApplicationClasspath.addJars(jdbcDir.getAbsolutePath());
-            } else {
-                ApplicationClasspath.addJarsRelative("../jdbc");
-            }
-        } catch (IOException ex) {
-            throw new IllegalArgumentException("Error adding jdbc-dir", ex);
-        } catch (URISyntaxException ex) {
-            throw new IllegalArgumentException("Error adding jdbc-dir: \"../jdbc\"", ex);
-        }
+        // Find the JDBC directory
+        File jdbcDir = findJdbcDirectory(config);
+
+        // Now load the JDBC drivers
+        loadJdbcDrivers(jdbcDir, config);
 
         // add optional resources to classpath
         if (config.hasResource()) {
@@ -283,6 +274,211 @@ public class App {
     }
 
     /**
+     * Finds the JDBC directory to use.
+     * 
+     * @param config the configuration
+     * @return the JDBC directory
+     * @throws IllegalArgumentException if no valid JDBC directory could be found
+     */
+    private File findJdbcDirectory(Config config) throws IllegalArgumentException {
+        File jdbcDir = null;
+        
+        // First check if user specified a JDBC directory
+        if (config.hasJdbcDir()) {
+            jdbcDir = config.getJdbcDir();
+            if (!jdbcDir.exists() || !jdbcDir.isDirectory()) {
+                throw new IllegalArgumentException("JDBC directory does not exist or is not a directory: " + jdbcDir.getAbsolutePath());
+            }
+            if (config.isVerbose()) {
+                configSink.println("Using user-specified jdbc-dir: " + jdbcDir.getAbsolutePath());
+            }
+            return jdbcDir;
+        }
+        
+        // If not specified, try multiple locations - only show paths in verbose mode
+        if (config.isVerbose()) {
+            configSink.println("Looking for JDBC directory...");
+        }
+        
+        // 1. Try current directory's jdbc folder
+        File currentDir = new File(".").getAbsoluteFile();
+        if (config.isVerbose()) {
+            configSink.println("Current directory: " + currentDir.getAbsolutePath());
+        }
+        jdbcDir = new File(currentDir, "jdbc");
+        if (config.isVerbose()) {
+            configSink.println("Checking: " + jdbcDir.getAbsolutePath() + " - " + (jdbcDir.exists() && jdbcDir.isDirectory() ? "FOUND" : "NOT FOUND"));
+        }
+        if (jdbcDir.exists() && jdbcDir.isDirectory()) {
+            if (config.isVerbose()) {
+                configSink.println("Using jdbc-dir: " + jdbcDir.getAbsolutePath());
+            }
+            return jdbcDir;
+        }
+        
+        // 2. Try parent directory's jdbc folder
+        jdbcDir = new File(currentDir.getParent(), "jdbc");
+        if (config.isVerbose()) {
+            configSink.println("Checking: " + jdbcDir.getAbsolutePath() + " - " + (jdbcDir.exists() && jdbcDir.isDirectory() ? "FOUND" : "NOT FOUND"));
+        }
+        if (jdbcDir.exists() && jdbcDir.isDirectory()) {
+            if (config.isVerbose()) {
+                configSink.println("Using jdbc-dir: " + jdbcDir.getAbsolutePath());
+            }
+            return jdbcDir;
+        }
+        
+        // 3. Try to find the JDBC directory relative to the application path
+        try {
+            File appPath = new File(App.class.getProtectionDomain().getCodeSource().getLocation().toURI().getPath());
+            if (config.isVerbose()) {
+                configSink.println("Application path: " + appPath.getAbsolutePath());
+            }
+            
+            // If we're in a bin directory, check for jdbc as a sibling
+            File appDir = appPath.getParentFile();
+            if (appDir != null) {
+                if (config.isVerbose()) {
+                    configSink.println("Application directory: " + appDir.getAbsolutePath());
+                }
+                if (appDir.getName().equalsIgnoreCase("bin")) {
+                    jdbcDir = new File(appDir.getParent(), "jdbc");
+                    if (config.isVerbose()) {
+                        configSink.println("Checking: " + jdbcDir.getAbsolutePath() + " - " + (jdbcDir.exists() && jdbcDir.isDirectory() ? "FOUND" : "NOT FOUND"));
+                    }
+                    if (jdbcDir.exists() && jdbcDir.isDirectory()) {
+                        if (config.isVerbose()) {
+                            configSink.println("Using jdbc-dir: " + jdbcDir.getAbsolutePath());
+                        }
+                        return jdbcDir;
+                    }
+                }
+            }
+        } catch (URISyntaxException e) {
+            if (config.isVerbose()) {
+                configSink.println("Error determining application path: " + e.getMessage());
+            }
+        }
+        
+        // If we got here, no valid directory was found
+        throw new IllegalArgumentException("Could not find JDBC directory. Please specify using --jdbc-dir option.");
+    }
+
+    /**
+     * Loads JDBC drivers from the specified directory.
+     * Tries multiple approaches to handle different Java versions.
+     * 
+     * @param jdbcDir directory containing JDBC driver JARs
+     * @param config configuration for verbose output
+     * @throws IllegalArgumentException if drivers cannot be loaded
+     */
+    private void loadJdbcDrivers(File jdbcDir, Config config) throws IllegalArgumentException {
+        if (config.isVerbose()) {
+            configSink.println("Loading JDBC drivers from: " + jdbcDir.getAbsolutePath());
+        }
+        
+        // Check if JDBC directory exists and is readable
+        if (!jdbcDir.exists()) {
+            throw new IllegalArgumentException("JDBC directory does not exist: " + jdbcDir.getAbsolutePath());
+        }
+        
+        if (!jdbcDir.isDirectory()) {
+            throw new IllegalArgumentException("Not a directory: " + jdbcDir.getAbsolutePath());
+        }
+        
+        if (!jdbcDir.canRead()) {
+            throw new IllegalArgumentException("Cannot read JDBC directory: " + jdbcDir.getAbsolutePath());
+        }
+        
+        // List all files in the JDBC directory only in verbose mode
+        if (config.isVerbose()) {
+            File[] allFiles = jdbcDir.listFiles();
+            configSink.println("Files found in JDBC directory:");
+            if (allFiles == null || allFiles.length == 0) {
+                configSink.println("  No files found in JDBC directory!");
+            } else {
+                for (File file : allFiles) {
+                    configSink.println("  - " + file.getName() + " (" + file.length() + " bytes)");
+                }
+            }
+        }
+        
+        // Check for specific database driver JARs if using a database connection
+        if (config.getDbType() != null && !DsType.none.equals(config.getDbType())) {
+            // Verify if required driver files exist
+            boolean driverFound = false;
+
+            if (DsType.mysql.equals(config.getDbType())) {
+                driverFound = false;
+                File[] files = jdbcDir.listFiles();
+                if (files != null) {
+                    for (File file : files) {
+                        String filename = file.getName().toLowerCase();
+                        if (filename.contains("mysql") && filename.endsWith(".jar")) {
+                            driverFound = true;
+                            if (config.isVerbose()) {
+                                configSink.println("Found MySQL driver JAR: " + file.getName());
+                            }
+                            break;
+                        }
+                    }
+                }
+                
+                if (!driverFound && config.isVerbose()) {
+                    configSink.println("WARNING: No MySQL driver JAR found in " + jdbcDir.getAbsolutePath());
+                    configSink.println("         Download MySQL Connector/J from https://dev.mysql.com/downloads/connector/j/");
+                    configSink.println("         and place it in the jdbc directory.");
+                }
+            } else if (DsType.postgres.equals(config.getDbType())) {
+                driverFound = false;
+                File[] files = jdbcDir.listFiles();
+                if (files != null) {
+                    for (File file : files) {
+                        String filename = file.getName().toLowerCase();
+                        if ((filename.contains("postgresql") || filename.contains("postgres")) && filename.endsWith(".jar")) {
+                            driverFound = true;
+                            if (config.isVerbose()) {
+                                configSink.println("Found PostgreSQL driver JAR: " + file.getName());
+                            }
+                            break;
+                        }
+                    }
+                }
+                
+                if (!driverFound && config.isVerbose()) {
+                    configSink.println("WARNING: No PostgreSQL driver JAR found in " + jdbcDir.getAbsolutePath());
+                    configSink.println("         Download PostgreSQL JDBC Driver from https://jdbc.postgresql.org/");
+                    configSink.println("         and place it in the jdbc directory.");
+                }
+            }
+        }
+
+        // First try using ApplicationClasspath (works for Java 8)
+        try {
+            ApplicationClasspath.addJars(jdbcDir.getAbsolutePath());
+            if (config.isVerbose()) {
+                configSink.println("Successfully loaded JDBC drivers via system classpath");
+            }
+            return;
+        } catch (IOException e) {
+            if (config.isVerbose()) {
+                configSink.println("Could not add to system classpath: " + e.getMessage());
+                configSink.println("Trying alternative driver loading method");
+            }
+        }
+
+        // If we get here, try the direct loading method (for Java 9+)
+        try {
+            loadJdbcDriversDirectly(jdbcDir, config);
+            if (config.isVerbose()) {
+                configSink.println("Successfully loaded JDBC drivers via direct loading");
+            }
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Failed to load JDBC drivers: " + e.getMessage(), e);
+        }
+    }
+
+    /**
      *
      * @param inputFile file or basename of a JasperReports file
      * @return a valid file that is not a directory and has a fileending of
@@ -340,7 +536,7 @@ public class App {
         parser.addArgument("-h", "--help").action(Arguments.help()).help("show this help message and exit");
         parser.addArgument("--locale").dest(Dest.LOCALE).metavar("<lang>")
                 .help("set locale with two-letter ISO-639 code"
-                + " or a combination of ISO-639 and ISO-3166 like de_DE");
+                        + " or a combination of ISO-639 and ISO-3166 like de_DE");
         parser.addArgument("-v", "--verbose").dest(Dest.DEBUG).action(Arguments.storeTrue()).help("display additional messages");
         parser.addArgument("-V", "--version").action(Arguments.version()).help("display version information and exit");
 
@@ -402,14 +598,14 @@ public class App {
                 .type(Arguments.enumType(AskFilter.class)).nargs("?")
                 .setConst(AskFilter.p)
                 .help("ask for report parameters. Filter: a, ae, u, ue, p, pe"
-                + " (see usage)");
+                        + " (see usage)");
         groupFillOptions.addArgument("-P").metavar("<param>").dest(Dest.PARAMS)
                 .nargs("+").help(
-                "report parameter: name=value [...]");
+                        "report parameter: name=value [...]");
         groupFillOptions.addArgument("-r").metavar("<resource>").dest(Dest.RESOURCE)
                 .nargs("?").setConst("").help(
-                "path to report resource dir or jar file. If <resource> is not"
-                + " given the input directory is used.");
+                        "path to report resource dir or jar file. If <resource> is not"
+                                + " given the input directory is used.");
 
         ArgumentGroup groupDatasourceOptions = parser.addArgumentGroup("datasource options");
         groupDatasourceOptions.addArgument("-t").metavar("<dstype>").dest(Dest.DS_TYPE).
@@ -447,7 +643,7 @@ public class App {
                 .help("number of copies. Defaults to 1");
         groupOutputOptions.addArgument("--out-field-del").metavar("<delimiter>").dest(Dest.OUT_FIELD_DEL).setDefault(",").help("Export CSV (Metadata) Field Delimiter - defaults to \",\"");
         groupOutputOptions.addArgument("--out-charset").metavar("<charset>").dest(Dest.OUT_CHARSET).setDefault("utf-8").help("Export CSV (Metadata) Charset - defaults to \"utf-8\"");
-        
+
         allArguments.put(argDbHost.getDest(), argDbHost);
         allArguments.put(argDbUser.getDest(), argDbUser);
         allArguments.put(argDbPasswd.getDest(), argDbPasswd);
@@ -494,11 +690,11 @@ public class App {
                     allArguments.get(Dest.CSV_COLUMNS).required(true);
                 }
             } else if (DsType.xml.equals(config.getDbType())) {
-              allArguments.get(Dest.DATA_FILE).required(true);
+                allArguments.get(Dest.DATA_FILE).required(true);
             } else if (DsType.json.equals(config.getDbType())) {
-              allArguments.get(Dest.DATA_FILE).required(true);
+                allArguments.get(Dest.DATA_FILE).required(true);
             } else if (DsType.jsonql.equals(config.getDbType())) {
-              allArguments.get(Dest.DATA_FILE).required(true);
+                allArguments.get(Dest.DATA_FILE).required(true);
             }
         }
         // parse again so changed arguments become effectiv
@@ -542,6 +738,128 @@ public class App {
                         param.getName(),
                         param.getValueClassName(),
                         (param.getDescription() != null ? param.getDescription() : ""));
+            }
+        }
+    }
+
+    /**
+     * Loads JDBC drivers directly for Java 9+ compatibility without modifying the
+     * classpath.
+     * This method attempts to load .jar files in the specified directory directly.
+     * 
+     * @param jdbcDir The directory containing JDBC driver JARs
+     * @param config  Configuration for verbose output
+     */
+    private void loadJdbcDriversDirectly(File jdbcDir, Config config) {
+        configSink.println("Attempting direct JAR loading from " + jdbcDir.getAbsolutePath());
+
+        if (!jdbcDir.isDirectory()) {
+            configSink.println("ERROR: JDBC directory is not a directory: " + jdbcDir.getAbsolutePath());
+            return;
+        }
+
+        File[] jarFiles = jdbcDir.listFiles(file -> file.getName().toLowerCase().endsWith(".jar"));
+        if (jarFiles == null || jarFiles.length == 0) {
+            configSink.println("No JAR files found in JDBC directory: " + jdbcDir.getAbsolutePath());
+            return;
+        }
+
+        // Display class path information
+        ClassLoader systemClassLoader = ClassLoader.getSystemClassLoader();
+        configSink.println("System ClassLoader type: " + systemClassLoader.getClass().getName());
+        configSink.println(
+                "Current Thread ClassLoader: " + Thread.currentThread().getContextClassLoader().getClass().getName());
+
+        try {
+            configSink.println("Java version: " + System.getProperty("java.version"));
+            configSink.println("Java vendor: " + System.getProperty("java.vendor"));
+        } catch (Exception e) {
+            configSink.println("Could not retrieve Java properties");
+        }
+
+        for (File jarFile : jarFiles) {
+            try {
+                configSink.println("Attempting to load JAR: " + jarFile.getAbsolutePath());
+
+                // Try using URLClassLoader directly
+                URL jarUrl = jarFile.toURI().toURL();
+                URLClassLoader childClassLoader = new URLClassLoader(
+                        new URL[] { jarUrl },
+                        Thread.currentThread().getContextClassLoader());
+                Thread.currentThread().setContextClassLoader(childClassLoader);
+
+                configSink.println("Successfully created ClassLoader for: " + jarFile.getAbsolutePath());
+
+                // Try to automatically register database drivers based on JAR name
+                String jarName = jarFile.getName().toLowerCase();
+
+                if (jarName.contains("mysql")) {
+                    configSink.println("Detected MySQL JAR: " + jarFile.getName());
+
+                    // Try legacy driver class
+                    try {
+                        String driverClass = "com.mysql.jdbc.Driver";
+                        configSink.println("Attempting to load driver class: " + driverClass);
+                        Class<?> driver = Class.forName(driverClass, true, childClassLoader);
+                        configSink.println("Successfully loaded MySQL JDBC driver class: " + driverClass);
+
+                        // Try to create an instance
+                        try {
+                            Object driverInstance = driver.getDeclaredConstructor().newInstance();
+                            configSink.println("Successfully created driver instance: " + driverInstance);
+                        } catch (Exception e) {
+                            configSink.println("Could not instantiate driver: " + e.getMessage());
+                        }
+                    } catch (ClassNotFoundException e) {
+                        configSink.println("Failed to load legacy MySQL driver: " + e.getMessage());
+
+                        // Try newer MySQL driver class
+                        try {
+                            String driverClass = "com.mysql.cj.jdbc.Driver";
+                            configSink.println("Attempting to load driver class: " + driverClass);
+                            Class<?> driver = Class.forName(driverClass, true, childClassLoader);
+                            configSink.println("Successfully loaded MySQL CJ JDBC driver class: " + driverClass);
+
+                            // Try to create an instance
+                            try {
+                                Object driverInstance = driver.getDeclaredConstructor().newInstance();
+                                configSink.println("Successfully created driver instance: " + driverInstance);
+                            } catch (Exception ex) {
+                                configSink.println("Could not instantiate driver: " + ex.getMessage());
+                            }
+                        } catch (ClassNotFoundException ex) {
+                            configSink.println("Failed to load newer MySQL driver: " + ex.getMessage());
+                        }
+                    }
+                } else if (jarName.contains("postgresql") || jarName.contains("postgres")) {
+                    configSink.println("Detected PostgreSQL JAR: " + jarFile.getName());
+
+                    try {
+                        String driverClass = "org.postgresql.Driver";
+                        configSink.println("Attempting to load driver class: " + driverClass);
+                        Class<?> driver = Class.forName(driverClass, true, childClassLoader);
+                        configSink.println("Successfully loaded PostgreSQL JDBC driver class: " + driverClass);
+                    } catch (ClassNotFoundException e) {
+                        configSink.println("Failed to load PostgreSQL driver: " + e.getMessage());
+                    }
+                } else if (jarName.contains("oracle")) {
+                    configSink.println("Detected Oracle JAR: " + jarFile.getName());
+
+                    try {
+                        String driverClass = "oracle.jdbc.driver.OracleDriver";
+                        configSink.println("Attempting to load driver class: " + driverClass);
+                        Class<?> driver = Class.forName(driverClass, true, childClassLoader);
+                        configSink.println("Successfully loaded Oracle JDBC driver class: " + driverClass);
+                    } catch (ClassNotFoundException e) {
+                        configSink.println("Failed to load Oracle driver: " + e.getMessage());
+                    }
+                } else {
+                    configSink.println(
+                            "Unknown JAR type, not attempting specific driver class loading: " + jarFile.getName());
+                }
+            } catch (Exception e) {
+                configSink.println("Failed to load JAR file: " + jarFile.getAbsolutePath());
+                configSink.println("Error: " + e.getClass().getName() + ": " + e.getMessage());
             }
         }
     }
